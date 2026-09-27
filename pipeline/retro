@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""retro -- retro transformer pipeline CLI (Python 3 stdlib only).
+
+Commands:
+    retro parse <file.cbl>
+        Parse COBOL to the IR and print it as JSON.
+
+    retro transform <file.cbl> --to java|python [--mock]
+        Full chain: parse -> IR -> engine transform -> write files
+        under out/<program>/.
+
+Mock mode is forced by --mock, by MOCK=1 in the environment, or when no
+watsonx.ai credentials are present (WATSONX_API_KEY / WATSONX_PROJECT_ID).
+
+The transformation engine is adapted through a small shim in this file:
+engine.transform.transform_program(ir, target) -> str.  This file never
+edits engine/; if the engine API changes, only _engine_transform() below
+needs updating.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import os
+import re
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+
+OUT_ROOT = os.path.join(REPO_ROOT, "out")
+
+
+# --------------------------------------------------------------------------
+# frontend loading (Agent 1 owns frontend/; fall back to a builtin scanner)
+# --------------------------------------------------------------------------
+def _try_frontend():
+    """Return (label, parse_fn) for the first working frontend entry point."""
+    candidates = [
+        ("frontend.parser", "parse_file"),
+        ("frontend.parser", "parse"),
+        ("frontend.cobol", "parse_file"),
+        ("frontend.cobol_parser", "parse_file"),
+        ("frontend", "parse_file"),
+        ("frontend", "parse"),
+    ]
+    for mod_name, attr in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        fn = getattr(mod, attr, None)
+        if callable(fn):
+            return f"{mod_name}.{attr}", fn
+    return "builtin-fallback", builtin_parse
+
+
+def builtin_parse(path: str) -> dict:
+    """Minimal COBOL scanner producing IR that honors the schema.
+
+    Used only when frontend/ is unavailable. Recognizes divisions,
+    sections, paragraphs, PROGRAM-ID, and captures every other
+    significant line as a statement with its type and line number.
+    """
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw_lines = fh.readlines()
+
+    program = os.path.splitext(os.path.basename(path))[0].upper()
+    divisions: list[dict] = []
+    cur_div = cur_sec = cur_para = None
+
+    def get_div(name: str) -> dict:
+        nonlocal divisions
+        for d in divisions:
+            if d["name"] == name:
+                return d
+        d = {"name": name, "sections": []}
+        divisions.append(d)
+        return d
+
+    def get_sec(div: dict, name: str) -> dict:
+        for s in div["sections"]:
+            if s["name"] == name:
+                return s
+        s = {"name": name, "paragraphs": []}
+        div["sections"].append(s)
+        return s
+
+    def get_para(sec: dict, name: str) -> dict:
+        for p in sec["paragraphs"]:
+            if p["name"] == name:
+                return p
+        p = {"name": name, "statements": []}
+        sec["paragraphs"].append(p)
+        return p
+
+    # ensure there is always somewhere to put statements
+    cur_div = get_div("PROCEDURE DIVISION")
+    cur_sec = get_sec(cur_div, "MAIN SECTION")
+    cur_para = get_para(cur_sec, "MAIN-PARAGRAPH")
+
+    for lineno, raw in enumerate(raw_lines, start=1):
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+        # comments: classic col-7 asterisk or free-format *>
+        if stripped.startswith("*") or stripped.startswith("*>"):
+            continue
+
+        m = re.match(r"^PROGRAM-ID\.\s+([A-Z0-9-]+)\.?$", upper)
+        if m:
+            program = m.group(1)
+            continue
+        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\s+DIVISION\.$", upper)
+        if m:
+            cur_div = get_div(m.group(1) + " DIVISION")
+            cur_sec = get_sec(cur_div, "MAIN SECTION")
+            cur_para = get_para(cur_sec, "MAIN-PARAGRAPH")
+            continue
+        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\s+SECTION\.$", upper)
+        if m:
+            cur_sec = get_sec(cur_div, m.group(1) + " SECTION")
+            cur_para = get_para(cur_sec, "MAIN-PARAGRAPH")
+            continue
+        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\.$", upper)
+        if m and " " not in m.group(1):
+            cur_para = get_para(cur_sec, m.group(1))
+            continue
+
+        stmt_type = upper.split()[0].rstrip(".")
+        cur_para["statements"].append(
+            {"type": stmt_type, "text": stripped, "line": lineno}
+        )
+
+    return {"program": program, "divisions": divisions}
+
+
+# --------------------------------------------------------------------------
+# engine shim (Agent 2 owns engine/; do not edit it)
+# --------------------------------------------------------------------------
+def _engine_transform_program(ir: dict, target: str, mock: bool) -> dict:
+    """Call the real engine and normalize its output to the file-dict form.
+
+    Real engine signature: transform_program(ir, target) -> str, with mock
+    mode selected by the MOCK=1 environment variable. We normalize to:
+        {"program": name, "files": [{"path": relpath, "content": str}]}
+    """
+    import engine.transform as engine_transform
+
+    had_mock = os.environ.get("MOCK")
+    if mock:
+        os.environ["MOCK"] = "1"
+    try:
+        text = engine_transform.transform_program(ir, target)
+    finally:
+        if had_mock is None:
+            os.environ.pop("MOCK", None)
+        else:
+            os.environ["MOCK"] = had_mock
+
+    program = str(ir.get("program", "PROGRAM")) if isinstance(ir, dict) else "PROGRAM"
+    if target == "java":
+        path = f"src/main/java/{program}/{program}.java"
+    else:
+        path = f"{program.lower()}.py"
+    return {"program": program, "files": [{"path": path, "content": text}]}
+
+
+def _wants_mock(args) -> bool:
+    if args.mock:
+        return True
+    if os.environ.get("MOCK", "").strip() == "1":
+        return True
+    # no credentials -> mock is the only thing that can run
+    if not os.environ.get("WATSONX_API_KEY", "").strip():
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+def cmd_parse(args) -> int:
+    label, parse_fn = _try_frontend()
+    ir = parse_fn(args.cobol_file)
+    print(json.dumps(ir, indent=2))
+    print(f"# parsed with {label}", file=sys.stderr)
+    return 0
+
+
+def cmd_transform(args) -> int:
+    label, parse_fn = _try_frontend()
+    ir = parse_fn(args.cobol_file)
+
+    mock = _wants_mock(args)
+    mode = "mock" if mock else "live watsonx.ai"
+
+    try:
+        result = _engine_transform_program(ir, args.to, mock)
+    except Exception as exc:  # noqa: BLE001 - report engine failures cleanly
+        print(f"error: engine failed: {exc}", file=sys.stderr)
+        return 2
+
+    program = result.get("program", "PROGRAM")
+    out_dir = os.path.join(OUT_ROOT, program)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # keep the IR next to the outputs for traceability
+    with open(os.path.join(out_dir, "ir.json"), "w", encoding="utf-8") as fh:
+        json.dump(ir, fh, indent=2)
+
+    written = []
+    for f in result.get("files", []):
+        dest = os.path.join(out_dir, f["path"])
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(f["content"])
+        written.append(f["path"])
+
+    print(f"[{mode}] {args.cobol_file} -> {out_dir} (parser: {label})")
+    for p in written:
+        print(f"  wrote {p}")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="retro", description="retro transformer pipeline CLI"
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("parse", help="parse COBOL and print the IR as JSON")
+    p.add_argument("cobol_file")
+    p.set_defaults(func=cmd_parse)
+
+    t = sub.add_parser("transform", help="parse + transform COBOL to java|python")
+    t.add_argument("cobol_file")
+    t.add_argument("--to", choices=["java", "python"], default="java")
+    t.add_argument("--mock", action="store_true",
+                   help="force mock mode (no credentials, no network)")
+    t.set_defaults(func=cmd_transform)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
