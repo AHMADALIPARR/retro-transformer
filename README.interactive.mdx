@@ -1,0 +1,113 @@
+<!--
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+retro-transformer
+Copyright (C) 2026 SnapKitty Collective
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+---
+title: "RETRO TRANSFORMER // COBOL MODERNIZATION UNIT"
+theme: cyberpunk
+repo: https://github.com/AHMADALIPARR/retro-transformer
+---
+
+import { Hero, CheckTicker, PipelineStepper, ArchStack, ModeToggle, LicenseBlock } from './components/cyberpunk'
+
+<Hero
+  kicker="MAINFRAME ARCHAEOLOGY // NEURAL REFINERY"
+  title="RETRO TRANSFORMER"
+  sub="COBOL MODERNIZATION UNIT"
+  tagline="Feed it 1960s COBOL. Get back structured IR and modern code — parsed by a hand-rolled frontend, refined by Granite on watsonx.ai."
+/>
+
+## The pipeline
+
+A strict four-stage refinery. Click through a real fixture — `HELLO.cbl` —
+as it moves down the line.
+
+<PipelineStepper
+  stages={[
+    {
+      name: "COBOL",
+      lang: "cobol",
+      code: "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. HELLO.\n       PROCEDURE DIVISION.\n       MAIN-LOGIC.\n           DISPLAY 'HELLO, WORLD'.\n           STOP RUN.",
+    },
+    {
+      name: "LEXER",
+      lang: "text",
+      code: "IDENTIFICATION → DIVISION → '.'\nPROGRAM-ID → '.' → HELLO → '.'\nPROCEDURE → DIVISION → '.'\nMAIN-LOGIC → '.'\nDISPLAY → 'HELLO, WORLD' → '.'\nSTOP → RUN → '.'",
+    },
+    {
+      name: "PARSER",
+      lang: "text",
+      code: "Program(HELLO)\n├─ IdentificationDivision\n└─ ProcedureDivision\n   └─ MAIN-LOGIC\n      ├─ DISPLAY 'HELLO, WORLD'\n      └─ STOP RUN",
+    },
+    {
+      name: "IR",
+      lang: "json",
+      code: '{\n  "program": "HELLO",\n  "divisions": [\n    { "name": "IDENTIFICATION" },\n    { "name": "PROCEDURE",\n      "sections": [{ "name": "MAIN-LOGIC" }] }\n  ]\n}',
+    },
+    {
+      name: "WATSONX",
+      lang: "text",
+      code: "Granite model refines IR → idiomatic target.\nIAM auth · retry with backoff · mock mode offline.",
+    },
+    {
+      name: "PYTHON",
+      lang: "python",
+      code: 'def main_logic():\n    print("HELLO, WORLD")\n\nif __name__ == "__main__":\n    main_logic()',
+    },
+  ]}
+/>
+
+## Verified
+
+<CheckTicker passed={31} total={31} label="frontend checks" />
+<CheckTicker passed={null} total={null} label="e2e suite — ALL TESTS PASSED" />
+
+Fixtures on the line: `hello.cbl`, `fileio.cbl`, `payroll.cbl` — every one
+parsed, IR-asserted, transformed.
+
+## Architecture
+
+<ArchStack
+  layers={[
+    { name: "frontend/", desc: "Hand-rolled COBOL lexer, parser, IR — zero deps" },
+    { name: "engine/", desc: "watsonx.ai client, chunking, prompts, transform" },
+    { name: "pipeline/retro", desc: "CLI: parse · transform · mock" },
+    { name: "deploy/", desc: "Dockerfile + Code Engine job spec" },
+  ]}
+/>
+
+## Two modes
+
+<ModeToggle
+  modes={[
+    { name: "MOCK", desc: "Zero credentials. Full pipeline runs offline — fixtures in, modern code out." },
+    { name: "LIVE", desc: "Real watsonx.ai credentials. IAM flow, retries, Granite refinement." },
+  ]}
+/>
+
+```sh
+# parse a COBOL file to IR
+./pipeline/retro parse fixtures/hello.cbl
+# full mock transform (no network, no credentials)
+./pipeline/retro transform fixtures/hello.cbl --to python --mock
+# run the end-to-end suite
+python3 tests/test_e2e.py
+```
+
+<LicenseBlock spdx="AGPL-3.0-or-later" holder="SnapKitty Collective" year="2026" />
